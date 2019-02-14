@@ -61,9 +61,25 @@ EXAMPLES = r'''
 '''
 
 from ansible.module_utils.basic import AnsibleModule
+from ansible.module_utils.six import string_types
 
 OPS = ('=', '-', '+')
 
+# The man page for setcap(8) is sparse and it works in somewhat surprising ways
+#
+# 1. Whatever you specify are the capabilities that the file has after running. Every time you run setcap, it replaces all
+#    caps with whatever you specified when you ran it. This means that the '-' operator is effectively useless.
+# 2. If a cap appears multiple times in the setcap args, the last one applies.
+# 3. setcap -v doesn't check whether the flags are valid, just checks for differences, so the subsequent setcap call can
+#    fail
+# 4. setcap -v isn't entirely trustworthy: if you try to, for example, `setcap -v cap_foo+e bar` on a cap-less bar, it
+#    will indicate change would occur. If you then `setcap cap_foo+e bar` it will appear to succeed, but the cap is not
+#    set, because a cap cannot be added to the effective set if it's not also in the permitted sets. So for completeness
+#    you actually need to check getcap before and after. That said, I don't think it will lie the other way and tell you
+#    that you don't need to setcap when in fact you do.
+#
+# The above are maybe just an implementation detail you cannot assume about all potential setcap(8) implementations. The
+# implementation of setcap is not defined in POSIX.1e.
 
 class CapabilitiesModule(object):
     platform = 'Linux'
@@ -72,42 +88,55 @@ class CapabilitiesModule(object):
     def __init__(self, module):
         self.module = module
         self.path = module.params['path'].strip()
-        self.capability = module.params['capability'].strip().lower()
         self.state = module.params['state']
+        self.exclusive = False
         self.getcap_cmd = module.get_bin_path('getcap', required=True)
         self.setcap_cmd = module.get_bin_path('setcap', required=True)
-        self.capability_tup = self._parse_cap(self.capability, op_required=self.state == 'present')
+
+        capability = module.params['capability']
+        if isinstance(capability, string_types):
+            self._init_clauses(capability.strip().split())
+        elif isinstance(capability, list):
+            self._init_clauses(capability)
+        elif capability is None and self.state == 'absent':
+            self.exclusive = True
+            self.clauses = [('all', '=')]
+        else:
+            self.module.fail_json(msg="Invalid type for 'capability' param: %s" % type(capability))
 
         self.run()
 
+    def _init_clauses(self, clause_strings):
+        if self.state == 'absent':
+            if self.exclusive:
+                # FIXME: english gooder
+                self.module.fail_json(msg="The 'exclusive' parameter is nonsensical when 'state = absent'")
+            self.clauses = self._parse_clauses(clause_strings, absent=True)
+        else:
+            self.clauses = self._parse_clauses(clause_strings)
+
     def run(self):
+        if self.exclusive:
+            clauses = self.clauses
+        else:
+            clauses = self.merge_clauses()
+        self.setcap(clauses)
 
-        current = self.getcap(self.path)
-        caps = [cap[0] for cap in current]
-
-        if self.state == 'present' and self.capability_tup not in current:
-            # need to add capability
-            if self.module.check_mode:
-                self.module.exit_json(changed=True, msg='capabilities changed')
+    def merge_clauses(self):
+        clauses = self.getcap()
+        caps = [clause[0] for clause in clauses]
+        for clause in self.clauses:
+            if clause[0] in caps:
+                # If the cap is already set, merge new actions with existing
+                i = caps.index(clause[0])
+                actions = self._merge_actions(clauses[i][1], clause[1])
+                clauses[i] = (clause[0], actions)
             else:
-                # remove from current cap list if it's already set (but op/flags differ)
-                current = list(filter(lambda x: x[0] != self.capability_tup[0], current))
-                # add new cap with correct op/flags
-                current.append(self.capability_tup)
-                self.module.exit_json(changed=True, state=self.state, msg='capabilities changed', stdout=self.setcap(self.path, current))
-        elif self.state == 'absent' and self.capability_tup[0] in caps:
-            # need to remove capability
-            if self.module.check_mode:
-                self.module.exit_json(changed=True, msg='capabilities changed')
-            else:
-                # remove from current cap list and then set current list
-                current = filter(lambda x: x[0] != self.capability_tup[0], current)
-                self.module.exit_json(changed=True, state=self.state, msg='capabilities changed', stdout=self.setcap(self.path, current))
-        self.module.exit_json(changed=False, state=self.state)
+                clauses.append(clause)
+        return clauses
 
-    def getcap(self, path):
-        rval = []
-        cmd = "%s -v %s" % (self.getcap_cmd, path)
+    def getcap(self):
+        cmd = [self.getcap_cmd, '-v', self.path]
         rc, stdout, stderr = self.module.run_command(cmd)
         # If file xattrs are set but no caps are set the output will be:
         #   '/foo ='
@@ -115,47 +144,116 @@ class CapabilitiesModule(object):
         #   '/foo'
         # If the file does not eixst the output will be (with rc == 0...):
         #   '/foo (No such file or directory)'
-        if rc != 0 or (stdout.strip() != path and stdout.count(' =') != 1):
-            self.module.fail_json(msg="Unable to get capabilities of %s" % path, stdout=stdout.strip(), stderr=stderr)
-        if stdout.strip() != path:
-            caps = stdout.split(' =')[1].strip().split()
-            for cap in caps:
-                cap = cap.lower()
-                # getcap condenses capabilities with the same op/flags into a
-                # comma-separated list, so we have to parse that
-                if ',' in cap:
-                    cap_group = cap.split(',')
-                    cap_group[-1], op, flags = self._parse_cap(cap_group[-1])
-                    for subcap in cap_group:
-                        rval.append((subcap, op, flags))
-                else:
-                    rval.append(self._parse_cap(cap))
-        return rval
+        if rc != 0 or (stdout.strip() != self.path and stdout.count(' =') != 1):
+            self.module.fail_json(msg="Unable to get capabilities of %s" % self.path, stdout=stdout.strip(), stderr=stderr)
+        if stdout.strip() != self.path:
+            return self._parse_clauses(stdout.split(' =')[1].strip().split())
+        return []
 
-    def setcap(self, path, caps):
-        caps = ' '.join([''.join(cap) for cap in caps])
-        cmd = "%s '%s' %s" % (self.setcap_cmd, caps, path)
+    def setcap(self, clauses):
+        clauses = ' '.join([''.join(clause) for clause in clauses])
+        cmd = [self.setcap_cmd, '-v', clauses, self.path]
         rc, stdout, stderr = self.module.run_command(cmd)
         if rc != 0:
-            self.module.fail_json(msg="Unable to set capabilities of %s" % path, stdout=stdout, stderr=stderr)
-        else:
-            return stdout
-
-    def _parse_cap(self, cap, op_required=True):
-        opind = -1
-        try:
-            i = 0
-            while opind == -1:
-                opind = cap.find(OPS[i])
-                i += 1
-        except Exception:
-            if op_required:
-                self.module.fail_json(msg="Couldn't find operator (one of: %s)" % str(OPS))
+            # Change will occur when running setcap
+            if self.module.check_mode:
+                self.module.exit_json(changed=True, state=self.state, path=self.path, msg='capabilities changed')
             else:
-                return (cap, None, None)
-        op = cap[opind]
-        cap, flags = cap.split(op)
-        return (cap, op, flags)
+                self.setcap_real(clauses)
+        else:
+            self.module.exit_json(changed=False, state=self.state, path=self.path)
+
+    def setcap_real(self, clauses_str):
+        cmd = [self.setcap_cmd, clauses_str, self.path]
+        rc, stdout, stderr = self.module.run_command(cmd)
+        if rc != 0:
+            self.module.fail_json(msg="Unable to set capabilities of %s" % self.path, stdout=stdout, stderr=stderr)
+        else:
+            # TODO: verify that before == after?
+            self.module.exit_json(changed=True, state=self.state, path=self.path, msg='capabilities changed', stdout=stdout)
+
+    def _merge_actions(self, *actions):
+        """
+
+        This is done rather than just appending the value of the capability param to the existing clauses because
+        ``setcap(8)``'s behavior may be implementation-specific. This allows us to essentially implement what
+        ``cap_from_text(3)`` specifies nonexclusively since ``setcap(8)`` doesn't do it, and we can't trust that it will
+        always behave the way it does in development on my system.
+
+        :param actions: list of actions to merge, later items supercede
+        """
+        # FIXME: proper error handling
+        flags = set()
+        for action in actions:
+            mode = None
+            eq = False
+            l = None
+            for c in action:
+                if c == '=':
+                    assert not eq, "Already had an `=`, can't have 2!"
+                    flags.clear()
+                    eq = True
+                    mode = '+'
+                elif c in ('+', '-'):
+                    assert l not in ('+', '-'), "Can't do that!"
+                    mode = c
+                elif c in ('e', 'i', 'p'):
+                    assert mode is not None, "No operator!"
+                    if mode == '+':
+                        flags.add(c)
+                    elif mode == '-':
+                        flags.discard(c)
+                else:
+                    raise Exception("Unknown char in action list!: `%s`" % c)
+        return '=' + ''.join(sorted(flags))
+
+    def _parse_clauses(self, clauses, absent=False):
+        """Parse a list of capabilities clauses
+
+        Clauses take the format described in ``cap_to_text(3)``.
+
+        :param clauses: individual clauses
+        :type clauses:  list of str
+        
+        :returns: list of (capability, action-list) tuples
+        """
+        rval = []
+        for clause in clauses:
+            clause = clause.lower()
+            # Capabilities with the same action list are condensed into a comma-separated list
+            if ',' in clause:
+                caps = clause.split(',')
+                # The last item in the list has the action list
+                caps[-1], actions = self._parse_clause(caps[-1], absent=absent)
+                for cap in caps:
+                    rval.append((cap, actions))
+            else:
+                rval.append(self._parse_clause(clause, absent=absent))
+        return rval
+
+    def _parse_clause(self, clause, absent=False):
+        """Parse a single capabilities clause
+
+        :param clause: capabilities clause with a single capability (no commas)
+        :type clause:  str
+
+        :returns: (capability, action-list) tuple
+        """
+        action = None
+        for i, c in enumerate(clause):
+            if c in OPS:
+                break
+        else:
+            if absent:
+                return (clause, '=')
+            self.module.fail_json(msg="Couldn't find operator (one of: %s)" % str(OPS))
+        cap = clause[:i]
+        if not absent:
+            action = clause[i:]
+        else:
+            # TODO: absent w/ actions is nonsensical, should we fail here instead?
+            action = '='
+        return (cap, action)
 
 
 # ==============================================================
@@ -166,7 +264,8 @@ def main():
     module = AnsibleModule(
         argument_spec=dict(
             path=dict(type='str', required=True, aliases=['key']),
-            capability=dict(type='str', required=True, aliases=['cap']),
+            capability=dict(type='raw', aliases=['cap']),
+            exclusive=dict(type='bool', default=False),
             state=dict(type='str', default='present', choices=['absent', 'present']),
         ),
         supports_check_mode=True,
