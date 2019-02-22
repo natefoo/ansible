@@ -241,6 +241,7 @@ class CapabilitiesModule(object):
         :type cached:   bool
         """
         if self.__getcap is None or not cached:
+            self.__getcap = []
             cmd = [self.getcap_cmd, '-v', self.path]
             rc, stdout, stderr = self.module.run_command(cmd)
             # If file xattrs are set but no caps are set the output will be:
@@ -281,7 +282,7 @@ class CapabilitiesModule(object):
             self.__setcap(clauses)
         else:
             # No change
-            self.exit()
+            self.exit(capabilities=self.getcap())
 
     def __setcap(self, clauses_str):
         """Run ``setcap(8)`` on the given path.
@@ -295,9 +296,9 @@ class CapabilitiesModule(object):
         if rc != 0:
             self.fail(msg="Unable to set capabilities of %s" % self.path, stdout=stdout, stderr=stderr)
         elif precaps != self.getcap(cached=False):
-            self.exit(changed=True, msg='capabilities changed', stdout=stdout)
+            self.exit(changed=True, msg='capabilities changed', stdout=stdout, capabilities=self.getcap())
         else:
-            self.exit(stdout=stdout)
+            self.exit(stdout=stdout, capabilities=self.getcap())
 
 # ==============================================================
 # main
